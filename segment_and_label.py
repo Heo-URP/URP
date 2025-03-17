@@ -4,17 +4,58 @@ import matplotlib.pyplot as plt
 from PIL import Image
 import cv2
 from transformers import CLIPProcessor, CLIPModel
-from segment_anything import sam_model_registry, SamPredictor
+
+# Try different import approaches for SAM 2.1
+try:
+    # First try direct import for SAM 2.1
+    from segment_anything.modeling import Sam2Model
+    from segment_anything import SamPredictor
+    SAM2_AVAILABLE = True
+    print("Using SAM 2.1 via direct Sam2Model import")
+except ImportError:
+    try:
+        # Try segment-anything-fast library
+        from segment_anything_fast import sam2_model_registry, SamPredictor
+        SAM2_AVAILABLE = True
+        print("Using SAM 2.1 via segment-anything-fast")
+    except ImportError:
+        try:
+            # Try updated segment-anything with sam2_model_registry
+            from segment_anything import sam2_model_registry, SamPredictor
+            SAM2_AVAILABLE = True
+            print("Using SAM 2.1 via segment_anything.sam2_model_registry")
+        except ImportError:
+            # Fall back to original SAM
+            from segment_anything import sam_model_registry, SamPredictor
+            SAM2_AVAILABLE = False
+            print("SAM 2.1 not available, falling back to original SAM")
 
 class SAMCLIPLabeler:
     def __init__(self, sam_checkpoint, device="cuda" if torch.cuda.is_available() else "cpu"):
-
         self.device = device
         print(f"Using device: {device}")
         
-        # Initialize SAM
-        print("Loading SAM model...")
-        self.sam = sam_model_registry["vit_b"](checkpoint=sam_checkpoint)
+        # Initialize SAM model
+        if SAM2_AVAILABLE:
+            print(f"Loading SAM 2.1 model from {sam_checkpoint}...")
+            try:
+                # Try direct model loading first
+                if 'Sam2Model' in globals():
+                    self.sam = Sam2Model.from_pretrained("sam2_hiera_l", checkpoint=sam_checkpoint)
+                    print("Successfully loaded SAM 2.1 using direct loading!")
+                else:
+                    # Try registry approach
+                    self.sam = sam2_model_registry["sam2_hiera_l"](checkpoint=sam_checkpoint)
+                    print("Successfully loaded SAM 2.1 using registry!")
+            except Exception as e:
+                print(f"Error loading SAM 2.1: {str(e)}")
+                print("Falling back to original SAM...")
+                # Fallback to original SAM
+                self.sam = sam_model_registry["vit_h"](checkpoint=sam_checkpoint)
+        else:
+            print(f"Loading original SAM model from {sam_checkpoint}...")
+            self.sam = sam_model_registry["vit_h"](checkpoint=sam_checkpoint)
+            
         self.sam.to(device=self.device)
         self.predictor = SamPredictor(self.sam)
         
@@ -26,7 +67,6 @@ class SAMCLIPLabeler:
         print("Models loaded successfully!")
         
     def generate_masks_from_points(self, image_path, num_points=16):
-
         # Load the image
         image = cv2.imread(image_path)
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
@@ -75,23 +115,40 @@ class SAMCLIPLabeler:
         return image, filtered_masks
     
     def generate_automatic_masks(self, image_path):
-
-        from segment_anything import SamAutomaticMaskGenerator
+        # Import the appropriate mask generator
+        if SAM2_AVAILABLE:
+            try:
+                from segment_anything import SamAutomaticMaskGenerator
+            except ImportError:
+                from segment_anything_fast import SamAutomaticMaskGenerator
+        else:
+            from segment_anything import SamAutomaticMaskGenerator
         
         # Load the image
         image = cv2.imread(image_path)
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         
-        # Initialize the automatic mask generator
-        mask_generator = SamAutomaticMaskGenerator(
-            model=self.sam,
-            points_per_side=32,
-            pred_iou_thresh=0.86,
-            stability_score_thresh=0.92,
-            crop_n_layers=1,
-            crop_n_points_downscale_factor=2,
-            min_mask_region_area=100,
-        )
+        # Initialize the automatic mask generator with parameters optimized for the model being used
+        if SAM2_AVAILABLE:
+            mask_generator = SamAutomaticMaskGenerator(
+                model=self.sam,
+                points_per_side=32,
+                pred_iou_thresh=0.88,  # Slightly higher for SAM 2.1
+                stability_score_thresh=0.95,
+                crop_n_layers=1,
+                crop_n_points_downscale_factor=2,
+                min_mask_region_area=100,
+            )
+        else:
+            mask_generator = SamAutomaticMaskGenerator(
+                model=self.sam,
+                points_per_side=32,
+                pred_iou_thresh=0.86,
+                stability_score_thresh=0.92,
+                crop_n_layers=1,
+                crop_n_points_downscale_factor=2,
+                min_mask_region_area=100,
+            )
         
         # Generate masks
         masks = mask_generator.generate(image)
@@ -105,7 +162,6 @@ class SAMCLIPLabeler:
         return image, binary_masks
     
     def non_max_suppression(self, masks, threshold=0.5):
-
         if not masks:
             return []
             
@@ -136,8 +192,21 @@ class SAMCLIPLabeler:
         
         return [masks[i] for i in keep]
     
-    def label_segments(self, image, masks, candidate_labels):
-
+    def label_segments(self, image, masks, candidate_labels, prompt=None, threshold=0.2):
+        """
+        Label image segments using CLIP and optionally filter by a prompt.
+        
+        Args:
+            image: RGB image as numpy array
+            masks: List of binary masks
+            candidate_labels: List of text labels to classify against
+            prompt: Optional text prompt to filter segments (e.g., "a cat sitting on sofa")
+            threshold: Confidence threshold for prompt filtering
+            
+        Returns:
+            List of tuples containing (mask, label, confidence) or 
+            (mask, label, confidence, prompt_score) if prompt is provided
+        """
         results = []
         
         for mask in masks:
@@ -148,27 +217,27 @@ class SAMCLIPLabeler:
             # Convert to PIL Image for CLIP
             masked_pil = Image.fromarray(masked_image)
             
-            # Prepare text inputs
-            text_inputs = self.clip_processor(
-                text=candidate_labels,
-                return_tensors="pt",
-                padding=True
-            ).to(self.device)
-            
             # Prepare image inputs
             image_inputs = self.clip_processor(
                 images=masked_pil,
                 return_tensors="pt"
             ).to(self.device)
             
-            # Get CLIP outputs
+            # Prepare text inputs for candidate labels
+            text_inputs = self.clip_processor(
+                text=candidate_labels,
+                return_tensors="pt",
+                padding=True
+            ).to(self.device)
+            
+            # Get CLIP outputs for candidate labels
             with torch.no_grad():
                 outputs = self.clip_model(**{
                     **image_inputs,
                     **text_inputs
                 })
             
-            # Calculate similarity scores
+            # Calculate similarity scores for candidate labels
             logits_per_image = outputs.logits_per_image
             probs = logits_per_image.softmax(dim=1)
             
@@ -177,12 +246,49 @@ class SAMCLIPLabeler:
             confidence = probs[0][best_idx].item()
             best_label = candidate_labels[best_idx]
             
-            results.append((mask, best_label, confidence))
+            # If prompt is provided, check if this segment matches the prompt
+            if prompt:
+                # Process the prompt
+                prompt_inputs = self.clip_processor(
+                    text=[prompt],
+                    return_tensors="pt",
+                    padding=True
+                ).to(self.device)
+                
+                # Get CLIP outputs for the prompt
+                with torch.no_grad():
+                    prompt_outputs = self.clip_model(**{
+                        **image_inputs,
+                        **prompt_inputs
+                    })
+                
+                # Calculate similarity score for the prompt
+                prompt_logits = prompt_outputs.logits_per_image
+                prompt_score = prompt_logits[0][0].item()
+                
+                # Only keep segments with high enough similarity to the prompt
+                if prompt_score >= threshold:
+                    results.append((mask, best_label, confidence, prompt_score))
+            else:
+                # If no prompt, keep all segments
+                results.append((mask, best_label, confidence))
         
+        # Sort by prompt score if prompt was provided
+        if prompt and results and len(results[0]) > 3:
+            results = sorted(results, key=lambda x: x[3], reverse=True)
+            
         return results
     
-    def visualize_results(self, image, results, output_path=None):
-
+    def visualize_results(self, image, results, output_path=None, show_prompt_score=False):
+        """
+        Visualize segmentation results.
+        
+        Args:
+            image: RGB image as numpy array
+            results: List of tuples from label_segments
+            output_path: Path to save visualization (optional)
+            show_prompt_score: Whether to show prompt matching score
+        """
         plt.figure(figsize=(12, 12))
         plt.imshow(image)
         
@@ -194,7 +300,17 @@ class SAMCLIPLabeler:
         ]
         
         # Plot each mask with its label
-        for i, (mask, label, confidence) in enumerate(results):
+        for i, result in enumerate(results):
+            if len(result) > 3:  # Has prompt score
+                mask, label, confidence, prompt_score = result
+                if show_prompt_score:
+                    score_text = f"{label} (match: {prompt_score:.2f})"
+                else:
+                    score_text = f"{label} ({confidence:.2f})"
+            else:
+                mask, label, confidence = result
+                score_text = f"{label} ({confidence:.2f})"
+            
             colored_mask = np.ones((mask.shape[0], mask.shape[1], 4))
             colored_mask[:, :, :3] = colors[i][:3]
             colored_mask[:, :, 3] = mask * colors[i][3]
@@ -207,7 +323,7 @@ class SAMCLIPLabeler:
                 y_center = np.mean(y_indices)
                 plt.text(
                     x_center, y_center, 
-                    f"{label} ({confidence:.2f})",
+                    score_text,
                     color='white', fontsize=12, 
                     bbox=dict(facecolor='black', alpha=0.5)
                 )
@@ -223,7 +339,7 @@ class SAMCLIPLabeler:
 # Example usage
 def main():
     # Initialize the model
-    sam_checkpoint = "./models/sam_vit_b_01ec64.pth"  # Replace with actual path to the original SAM checkpoint
+    sam_checkpoint = "../checkpoints/sam2.1_hiera_large.pt"  # Path to SAM 2.1 model
     labeler = SAMCLIPLabeler(sam_checkpoint)
     
     # Define candidate labels (you can expand this list)
@@ -237,26 +353,49 @@ def main():
     # Path to your image
     image_path = "./images/cat1.jpg" 
     
-    # Process an image - choose one of the two methods:
+    # Prompt for what you want to segment
+    # Set to None if you want to label everything
+    segmentation_prompt = input("Enter what to segment (e.g., 'a black cat', 'a person wearing glasses'): ")
+    if segmentation_prompt.strip() == "":
+        segmentation_prompt = None
     
-    # Method 1: Using point-based segmentation
-    print("Generating masks from points...")
-    image, masks = labeler.generate_masks_from_points(image_path, num_points=25)
+    # Confidence threshold for prompt matching
+    threshold = 0.2  # Lower this value for more inclusive results
     
+    # Segmentation method
+    method = input("Choose segmentation method (auto/points) [auto]: ").lower() or "auto"
+    
+    # Process an image
+    print(f"Generating masks using {method} method...")
+    if method == "auto":
+        image, masks = labeler.generate_automatic_masks(image_path)
+    else:
+        image, masks = labeler.generate_masks_from_points(image_path, num_points=25)
     
     print(f"Found {len(masks)} segments")
     
-    # Label the segments
+    # Label the segments with optional prompt filter
     print("Labeling segments with CLIP...")
-    results = labeler.label_segments(image, masks, candidate_labels)
+    if segmentation_prompt:
+        print(f"Filtering for segments matching: '{segmentation_prompt}'")
     
-    # Visualize and save the results
-    output_path = "segmentation_result.jpg"
-    labeler.visualize_results(image, results, output_path)
+    results = labeler.label_segments(image, masks, candidate_labels, segmentation_prompt, threshold)
     
-    print(f"Processed image with {len(results)} labeled segments")
-    for i, (_, label, confidence) in enumerate(results):
-        print(f"Segment {i+1}: {label} (confidence: {confidence:.2f})")
+    if len(results) == 0:
+        print("No matching segments found. Try a different prompt or lower the threshold.")
+    else:
+        # Visualize and save the results
+        output_path = "segmentation_result.jpg"
+        labeler.visualize_results(image, results, output_path, show_prompt_score=segmentation_prompt is not None)
+        
+        print(f"Processed image with {len(results)} labeled segments")
+        for i, result in enumerate(results):
+            if segmentation_prompt and len(result) > 3:
+                _, label, confidence, prompt_score = result
+                print(f"Segment {i+1}: {label} (confidence: {confidence:.2f}, prompt match: {prompt_score:.2f})")
+            else:
+                _, label, confidence = result
+                print(f"Segment {i+1}: {label} (confidence: {confidence:.2f})")
 
 
 if __name__ == "__main__":
