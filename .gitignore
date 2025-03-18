@@ -1,2 +1,6 @@
 models
 venv
+/sam2/
+main.py
+/images/
+.DS_Store
